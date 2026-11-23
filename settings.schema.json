@@ -1,0 +1,72 @@
+{
+  "properties": {
+    "baseUrl": {
+      "type": "string",
+      "title": "Base URL",
+      "description": "Used when no application.yml/properties gives a port and context-path, e.g. http://localhost:8080.",
+      "default": "http://localhost:8080"
+    },
+    "requestTimeoutMs": {
+      "type": "integer",
+      "title": "Request timeout (ms)",
+      "description": "How long a Send Request call may wait before it is reported as timed out.",
+      "default": 30000
+    },
+    "extraHeaders": {
+      "type": "string",
+      "title": "Extra headers",
+      "description": "One Name: Value per line, added to every request this plugin sends (for example an auth cookie).",
+      "default": ""
+    },
+    "groupBy": {
+      "type": "string",
+      "title": "Group the route tree by",
+      "description": "module: the path before /src/main/; controller: the controller class.",
+      "enum": ["module", "controller"],
+      "default": "module"
+    },
+    "maxDepth": {
+      "type": "integer",
+      "title": "Max nesting depth",
+      "description": "Nested objects deeper than this become {} (default 4).",
+      "default": 4
+    },
+    "lineEnding": {
+      "type": "string",
+      "title": "Bulk Value line ending",
+      "description": "lf or crlf (default crlf).",
+      "enum": ["lf", "crlf"],
+      "default": "crlf"
+    },
+    "skipSerialVersionUid": {
+      "type": "boolean",
+      "title": "Skip serialVersionUID",
+      "description": "Leave serialVersionUID out of generated JSON and Bulk Value (default on).",
+      "default": true
+    },
+    "excludeTests": {
+      "type": "boolean",
+      "title": "Exclude test files",
+      "description": "Leave routes in test sources out of the index (tests/, test_*.py, *Test.java, src/test/…).",
+      "default": true
+    },
+    "excludeGlobs": {
+      "type": "string",
+      "title": "Excluded path globs",
+      "description": "Comma or newline separated globs; empty keeps the built-in defaults.",
+      "default": "**/tests/**,**/test/**,**/test_*.py,**/*_test.py,**/*Test.java,**/*Tests.java,**/src/test/**"
+    },
+    "projectPrefixFilter": {
+      "type": "string",
+      "title": "Project prefix filter",
+      "description": "When set, only routes from files whose path contains this text are indexed (e.g. haiyi-ai-commercial/backend).",
+      "default": ""
+    },
+    "activeProfile": {
+      "type": "string",
+      "title": "Spring profile",
+      "description": "Overrides spring.profiles.active when reading application-<profile>.* files; empty means read it from the config.",
+      "default": ""
+    }
+  }
+}

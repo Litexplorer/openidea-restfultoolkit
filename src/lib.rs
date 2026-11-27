@@ -24,6 +24,7 @@ pub mod http;
 pub mod index;
 pub mod json_gen;
 pub mod params;
+pub mod react_router;
 pub mod scan;
 pub mod tree;
 pub mod url;
@@ -154,7 +155,7 @@ impl Plugin for RestfulToolkit {
     }
 
     /// 参数：`events` 为订阅到的事件批次，`ctx` 为调用上下文。
-    /// 核心流程：`files-changed` 事件里新增/修改的 `.java`/`.kt` 只重扫该文件，删除的移除条目，
+    /// 核心流程：`files-changed` 事件里新增/修改的源码文件只重扫该文件，删除的移除条目，
     /// 再把索引写回 storage 并刷新视图；读写失败不 panic。
     fn handle_events(&mut self, events: &[Event], ctx: &Invocation) {
         let mut queued = false;
@@ -257,9 +258,24 @@ impl SearchProvider for RestfulToolkit {
             }
         }
         let limit = limit.clamp(1, 200) as usize;
-        let mut hits: Vec<index::Route> =
-            load_index_for(project_root(ctx).as_deref()).routes.into_iter().filter(|route| matches_query(&route.path, &needle)).collect();
-        if needle.is_empty() {
+        let index = load_index_for(project_root(ctx).as_deref());
+        let raw = needle.clone();
+        let (needle, filter, explicit) = parse_search_query(&needle);
+        let collect = |needle: &str, filter: Option<RouteFilter>| -> Vec<index::Route> {
+            index
+                .routes
+                .iter()
+                .filter(|route| matches_query(&route.path, needle))
+                .filter(|route| filter.is_none_or(|filter| route_matches_filter(route, filter)))
+                .cloned()
+                .collect()
+        };
+        let mut hits = collect(&needle, filter);
+        // 语法糖的兜底：`.ts` 过滤后一条都没有，就按原样的带点路径再搜一次。
+        if hits.is_empty() && filter.is_some() && !explicit {
+            hits = collect(&raw, None);
+        }
+        if needle.is_empty() && filter.is_none() {
             // 空查询只给前若干条建议：按模块名分组，模块内再按路径与方法。
             hits.sort_by(|a, b| {
                 tree::module_of(&a.file)
@@ -268,20 +284,31 @@ impl SearchProvider for RestfulToolkit {
                     .then_with(|| a.method.cmp(&b.method))
             });
         } else {
-            hits.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.method.cmp(&b.method)));
+            hits.sort_by(|a, b| {
+                a.path
+                    .cmp(&b.path)
+                    .then_with(|| route_file(a).cmp(route_file(b)))
+                    .then_with(|| a.method.cmp(&b.method))
+                    .then_with(|| a.handler.cmp(&b.handler))
+            });
         }
         let has_more = hits.len() > limit;
         let items = hits
             .into_iter()
             .take(limit)
             .map(|route| {
-                let line = route.line.saturating_sub(1);
+                let (file, line) = jump_location(&route);
+                let line = line.saturating_sub(1);
+                let description = match &route.jump {
+                    Some(jump) => jump.file.clone(),
+                    None => format!("{}:{}", route.file, route.line),
+                };
                 SearchItem {
                     id: tree::route_key(&route),
-                    title: format!("{} {}", route.method, route.path),
-                    description: Some(format!("{}:{}", route.file, route.line)),
+                    title: format!("[{}] {} {}", route_tag(&route), route.method, route.path),
+                    description: Some(description),
                     target: SearchTarget::Location(Location {
-                        path: route.file.clone(),
+                        path: file.to_string(),
                         range: Range::new(Position::new(line, 0), Position::new(line, 0)),
                     }),
                 }
@@ -333,6 +360,122 @@ fn literal_prefix(path: &str) -> &str {
     match path.find('{') {
         Some(at) => path[..at].trim_end_matches('/'),
         None => path,
+    }
+}
+
+/// 搜索过滤器：按来源扩展名或框架收窄结果。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RouteFilter {
+    Ext(&'static str),
+    Framework(&'static str),
+}
+
+/// 参数：`token` 为扩展名（`ts`/`tsx`/`js`/`jsx`/`py`/`java`/`kt`）。
+/// 核心流程：归一成小写并映射到过滤用的家族名；`ts`/`js` 同时覆盖 JSX/TSX。
+fn ext_filter(token: &str) -> Option<&'static str> {
+    Some(match token.to_ascii_lowercase().as_str() {
+        "ts" => "ts",
+        "tsx" => "tsx",
+        "js" => "js",
+        "jsx" => "jsx",
+        "py" => "py",
+        "java" => "java",
+        "kt" => "kt",
+        _ => return None,
+    })
+}
+
+/// 参数：`token` 为框架别名。
+/// 核心流程：`react` 映射到 `react-router`，其余与 framework 字段同名。
+fn framework_filter(token: &str) -> Option<&'static str> {
+    Some(match token.to_ascii_lowercase().as_str() {
+        "react" => "react-router",
+        "spring" => "spring",
+        "jaxrs" => "jaxrs",
+        "fastapi" => "fastapi",
+        _ => return None,
+    })
+}
+
+/// 参数：`needle` 为路径片段。
+/// 核心流程：末段是「.已知扩展名」时拆成（去掉后缀的路径，扩展名）；其余返回 None。
+fn split_ext_suffix(needle: &str) -> Option<(String, &'static str)> {
+    let at = needle.rfind('.')?;
+    let (base, ext) = needle.split_at(at);
+    let token = &ext[1..];
+    if base.is_empty() || token.is_empty() || token.contains('/') {
+        return None;
+    }
+    ext_filter(token).map(|ext| (base.to_string(), ext))
+}
+
+/// 参数：`query` 为搜索框原文（已去掉 URL 的 scheme/host/context-path）。
+/// 核心流程：`ext:x`/`fw:x` 是显式过滤；末尾 `.ts` 一类是语法糖；返回（路径词，过滤器，是否显式）。
+fn parse_search_query(query: &str) -> (String, Option<RouteFilter>, bool) {
+    let mut parts: Vec<&str> = Vec::new();
+    let mut filter = None;
+    let mut explicit = false;
+    for token in query.split_whitespace() {
+        let lower = token.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("ext:") {
+            if let Some(ext) = ext_filter(rest) {
+                filter = Some(RouteFilter::Ext(ext));
+                explicit = true;
+                continue;
+            }
+        }
+        if let Some(rest) = lower.strip_prefix("fw:") {
+            if let Some(framework) = framework_filter(rest) {
+                filter = Some(RouteFilter::Framework(framework));
+                explicit = true;
+                continue;
+            }
+        }
+        parts.push(token);
+    }
+    let mut needle = parts.join(" ");
+    if filter.is_none() {
+        if let Some((base, ext)) = split_ext_suffix(&needle) {
+            needle = base;
+            filter = Some(RouteFilter::Ext(ext));
+        }
+    }
+    (needle, filter, explicit)
+}
+
+/// 参数：`route` 为一条路由。
+/// 核心流程：优先用跳转目标文件（v7 是模块文件），否则用声明文件。
+pub(crate) fn route_file(route: &index::Route) -> &str {
+    route.jump.as_ref().map_or(route.file.as_str(), |jump| jump.file.as_str())
+}
+
+/// 参数：`route` 为一条路由。
+/// 核心流程：取来源文件扩展名作标签（`tsx`/`py`/`java`…），没有扩展名时退回框架名。
+pub(crate) fn route_tag(route: &index::Route) -> String {
+    let file = route_file(route);
+    match file.rsplit_once('.') {
+        Some((base, ext)) if !base.is_empty() && !ext.is_empty() && !ext.contains('/') => ext.to_ascii_lowercase(),
+        _ => match route.framework.as_str() {
+            "react-router" => "react".to_string(),
+            other => other.to_string(),
+        },
+    }
+}
+
+/// 参数：`route` 为一条路由，`filter` 为过滤器。
+/// 核心流程：扩展名按跳转目标文件的结尾匹配（`ts` 覆盖 `.ts/.tsx`，`js` 覆盖 `.js/.jsx`）；
+/// 框架按 framework 字段精确匹配。
+pub(crate) fn route_matches_filter(route: &index::Route, filter: RouteFilter) -> bool {
+    match filter {
+        RouteFilter::Framework(wanted) => route.framework == wanted,
+        RouteFilter::Ext(ext) => {
+            let file = route_file(route).to_ascii_lowercase();
+            match ext {
+                "ts" => file.ends_with(".ts") || file.ends_with(".tsx"),
+                "js" => file.ends_with(".js") || file.ends_with(".jsx"),
+                other => file.ends_with(&format!(".{other}")),
+            }
+        }
     }
 }
 
@@ -403,17 +546,25 @@ impl RestfulToolkit {
         };
         let files: Vec<&str> = index.routes.iter().map(|route| route.file.as_str()).collect();
         let subs = tree::subprojects(&files);
-        let items: Vec<PickItem> = routes.iter().map(|route| goto_item(route, &subs)).collect();
+        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+        for route in &index.routes {
+            *counts.entry(route.path.as_str()).or_default() += 1;
+        }
+        let items: Vec<PickItem> = routes
+            .iter()
+            .map(|route| goto_item(route, &subs, counts.get(route.path.as_str()).copied().unwrap_or(0) > 1))
+            .collect();
         let Some(key) = host::pick(&title, &items)? else { return Err(Error::Cancelled) };
         let Some(route) = index.routes.iter().find(|route| tree::route_key(route) == key) else {
             return Err(Error::Failed(tr("No routes match the filter")));
         };
-        if route.line == 0 {
+        let (file, line) = jump_location(route);
+        if line == 0 {
             return Err(Error::Failed(tr("Old index (no line numbers): rebuild the index")));
         }
-        let line = route.line.saturating_sub(1);
-        host::open_location(&route.file, line, 0).map_err(denied_hint)?;
-        Ok(format!("{}:{line}", route.file))
+        let line = line.saturating_sub(1);
+        host::open_location(file, line, 0).map_err(denied_hint)?;
+        Ok(format!("{file}:{line}"))
     }
 
     /// 参数：`ctx` 为调用上下文。
@@ -490,7 +641,7 @@ impl RestfulToolkit {
     }
 
     /// 参数：`created`/`modified`/`removed` 为宿主给出的路径，`ctx` 为调用上下文。
-    /// 核心流程：只处理 `.java`/`.kt`；读得到就 `update_file`（只重扫这一个文件），
+    /// 核心流程：只处理受支持的后端/前端源码；读得到就重扫该文件，
     /// 删掉的 `remove_file`；随后持久化并刷新视图。
     fn apply_file_changes(&mut self, created: &[String], modified: &[String], removed: &[String], ctx: &Invocation) {
         let (mut diag, started) = begin_diagnostics("event", ctx);
@@ -531,7 +682,7 @@ impl RestfulToolkit {
             diag.error = Some(if root.is_none() {
                 "未拿到项目根（window 未就绪或项目正在索引），请稍后重试".to_string()
             } else {
-                "files-changed 里没有可读的 .java/.kt".to_string()
+                "files-changed 里没有可读的源码文件".to_string()
             });
             finish_diagnostics(diag, started);
             return;
@@ -546,9 +697,9 @@ impl RestfulToolkit {
 }
 
 /// 参数：`path` 为文件路径。
-/// 核心流程：`.java` 或 `.kt` 才算路由来源。
+/// 核心流程：后端（java/kt/py）与前端（ts/tsx/js/jsx）源码都算路由来源。
 fn is_source(path: &str) -> bool {
-    path.ends_with(".java") || path.ends_with(".kt") || path.ends_with(".py")
+    matches!(path.rsplit('.').next(), Some("java" | "kt" | "py" | "tsx" | "jsx" | "ts" | "js"))
 }
 
 /// endpoints 一次最多交给宿主的条数（超过会被整份作废）。
@@ -610,14 +761,26 @@ impl EndpointsProvider for RestfulToolkit {
     }
 }
 
+/// 可复用的最老落盘格式：3 起 Route 的字段与当前兼容，新增字段都有 serde 默认。
+const MIN_PARSER_VERSION: u32 = 3;
+
+/// 参数：`stored` 为落盘里的解析器版本。
+/// 核心流程：解析成数字，落在 `[MIN_PARSER_VERSION, PARSER_VERSION]` 内就继续用，
+/// 避免只升一个版本就把用户已有路由全部清空。
+fn parser_compatible(stored: &str) -> bool {
+    let Ok(version) = stored.parse::<u32>() else { return false };
+    let current = PARSER_VERSION.parse::<u32>().unwrap_or(u32::MAX);
+    (MIN_PARSER_VERSION..=current).contains(&version)
+}
+
 /// 参数：`root` 为项目根（`None` 表示没有项目）。
-/// 核心流程：取该项目的索引键 → `RouteIndex::from_json`；缺失或损坏一律给空索引。
+/// 核心流程：取该项目的索引键 → `RouteIndex::from_json`；不兼容或损坏一律给空索引。
 pub(crate) fn load_index_for(root: Option<&str>) -> index::RouteIndex {
     let Some(json) = storage::get(&scoped_key(INDEX_KEY, root)).ok().flatten() else {
         return index::RouteIndex::default();
     };
     match serde_json::from_str::<StoredIndex>(&json) {
-        Ok(stored) if stored.parser_version == PARSER_VERSION => index::RouteIndex { routes: stored.routes },
+        Ok(stored) if parser_compatible(&stored.parser_version) => index::RouteIndex { routes: stored.routes },
         _ => index::RouteIndex::default(),
     }
 }
@@ -634,14 +797,18 @@ fn stored_parser_version(root: Option<&str>) -> String {
 }
 
 /// 参数：`root` 为项目根。
-/// 核心流程：版本不符时清空签名表与前缀图，让下一次重建必然全量重解析。
+/// 核心流程：兼容但更旧的索引保留路由（先让用户看得到），只清签名表让下一次刷新全量重扫；
+/// 完全不兼容时才整份丢弃。
 fn invalidate_derived(root: Option<&str>) -> bool {
-    if stored_parser_version(root) == PARSER_VERSION {
+    let stored = stored_parser_version(root);
+    if stored == PARSER_VERSION {
         return false;
     }
     let _ = storage::delete(&scoped_key(SIGNATURE_KEY, root));
     let _ = storage::delete(&scoped_key(PREFIX_GRAPH_KEY, root));
-    let _ = storage::delete(&scoped_key(INDEX_KEY, root));
+    if !parser_compatible(&stored) {
+        let _ = storage::delete(&scoped_key(INDEX_KEY, root));
+    }
     true
 }
 
@@ -663,7 +830,7 @@ fn load_prefix_graph(root: Option<&str>) -> fastapi::PrefixGraph {
         .ok()
         .flatten()
         .and_then(|json| serde_json::from_str::<StoredGraph>(&json).ok())
-        .filter(|stored| stored.parser_version == PARSER_VERSION)
+        .filter(|stored| parser_compatible(&stored.parser_version))
         .map(|stored| stored.graph)
         .unwrap_or_default()
 }
@@ -676,25 +843,52 @@ pub(crate) fn save_index_for(root: Option<&str>, index: &index::RouteIndex) -> R
     storage::set(&scoped_key(INDEX_KEY, root), &json)
 }
 
+/// 参数：`route` 为一条路由。
+/// 核心流程：v7 前端路由有模块目标时优先跳模块，其余退回声明位置；返回（文件，1 基行）。
+pub(crate) fn jump_location(route: &index::Route) -> (&str, u32) {
+    match &route.jump {
+        Some(jump) => (jump.file.as_str(), jump.line),
+        None => (route.file.as_str(), route.line),
+    }
+}
+
 /// 参数：`index` 为路由索引，`query` 为 URL 片段（空串给默认建议），`limit` 为条数上限。
 /// 核心流程：大小写不敏感地匹配路径/方法/处理方法名 → 按路径与方法排序 →
 /// 取前 `limit` 条，每条格式化成「方法 路径 ← 文件:行」，供命令直接展示。
 pub(crate) fn search(index: &index::RouteIndex, query: &str, limit: usize) -> Vec<String> {
-    let needle = query.trim().to_lowercase();
-    let mut hits: Vec<&index::Route> = index
-        .routes
-        .iter()
-        .filter(|route| {
-            needle.is_empty()
-                || route.path.to_lowercase().contains(&needle)
-                || route.method.to_lowercase().contains(&needle)
-                || route.handler.to_lowercase().contains(&needle)
-        })
-        .collect();
-    hits.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.method.cmp(&b.method)));
+    let raw = query.trim();
+    let (needle, filter, explicit) = parse_search_query(raw);
+    let text_hit = |route: &index::Route, needle: &str| -> bool {
+        let needle = needle.to_lowercase();
+        needle.is_empty()
+            || route.path.to_lowercase().contains(&needle)
+            || route.method.to_lowercase().contains(&needle)
+            || route.handler.to_lowercase().contains(&needle)
+    };
+    let collect = |needle: &str, filter: Option<RouteFilter>| -> Vec<&index::Route> {
+        index
+            .routes
+            .iter()
+            .filter(|route| text_hit(route, needle))
+            .filter(|route| filter.is_none_or(|filter| route_matches_filter(route, filter)))
+            .collect()
+    };
+    let mut hits = collect(&needle, filter);
+    if hits.is_empty() && filter.is_some() && !explicit {
+        hits = collect(raw, None);
+    }
+    hits.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then_with(|| route_file(a).cmp(route_file(b)))
+            .then_with(|| a.method.cmp(&b.method))
+    });
     hits.into_iter()
         .take(limit)
-        .map(|route| format!("{} {}  ← {}:{}", route.method, route.path, route.file, route.line))
+        .map(|route| {
+            let (file, line) = jump_location(route);
+            format!("[{}] {} {}  ← {file}:{line}", route_tag(route), route.method, route.path)
+        })
         .collect()
 }
 
@@ -970,11 +1164,13 @@ fn pick_command(ctx: &Invocation) -> Result<String, Error> {
 /// 参数：`route` 为一条路由。
 /// 核心流程：label 形如 `GET  /api/users/{id}  — getUser`（方法在前并对齐、路径居中），
 /// description 放文件名；key 用路由唯一 id，选中后据此反查路由。
-fn goto_item(route: &index::Route, subs: &[String]) -> PickItem {
+fn goto_item(route: &index::Route, subs: &[String], duplicate: bool) -> PickItem {
     let file = route.file.rsplit('/').next().unwrap_or(&route.file);
+    // 同路径出现在多个来源文件时才加来源标签，单条路由保持原来的简短标签。
+    let tag = if duplicate { format!("[{}] ", route_tag(route)) } else { String::new() };
     let label = match tree::subproject_of(&route.file, subs) {
-        Some(sub) => format!("[{sub}] {:<4} {}  — {}", route.method, route.path, route.handler),
-        None => format!("{:<4} {}  — {}", route.method, route.path, route.handler),
+        Some(sub) => format!("[{sub}] {tag}{:<4} {}  — {}", route.method, route.path, route.handler),
+        None => format!("{tag}{:<4} {}  — {}", route.method, route.path, route.handler),
     };
     PickItem::new(&tree::route_key(route), &label).description(file)
 }
@@ -1058,7 +1254,7 @@ fn copy_node_urls(ctx: &Invocation, key: &str) -> Result<String, Error> {
         Some(project) => base_url(&project)?,
         None => default_base_url(),
     };
-    let urls: Vec<String> = routes.iter().map(|route| url::join_url(&base, "", &route.path)).collect();
+    let urls: Vec<String> = routes.iter().map(|route| url::route_url(&base, &route.framework, &route.path)).collect();
     let joined = urls.join("\n\n");
     let note = copy_text(&joined)?;
     Ok(format!("{note}: {} URLs", urls.len()))
@@ -1091,7 +1287,7 @@ fn copy_many_urls(ctx: &Invocation) -> Result<String, Error> {
         .routes
         .iter()
         .filter(|route| keys.contains(&tree::route_key(route)))
-        .map(|route| url::join_url(&base, "", &route.path))
+        .map(|route| url::route_url(&base, &route.framework, &route.path))
         .collect();
     if urls.is_empty() {
         return Err(Error::Failed(tr("Copy failed")));
@@ -1115,7 +1311,7 @@ fn resolve(ctx: &Invocation) -> Result<(scan::Endpoint, String), Error> {
 }
 
 /// 参数：`ctx` 为命令调用上下文。
-/// 核心流程：收 `**/*.java` 与 `**/*.kt` → 逐个读文本（读不到就跳过）→
+/// 核心流程：按 `SOURCE_GLOBS` 收集源码 → 逐个读文本（读不到就跳过）→
 /// `index::RouteIndex::from_files` 建索引 → JSON 写入 storage；缺项目时报可读错误。
 fn refresh_index(ctx: &Invocation, trigger: &str) -> Result<(index::RouteIndex, String, bool), Error> {
     let (mut diag, started) = begin_diagnostics(trigger, ctx);
@@ -1137,7 +1333,7 @@ fn refresh_index(ctx: &Invocation, trigger: &str) -> Result<(index::RouteIndex, 
 }
 
 /// 参数：`ctx` 为命令上下文，`diag` 为逐步填充的诊断快照。
-/// 核心流程：项目根 → 两个 glob 的 find_files（记数与错误）→ 逐文件 read_file（记成功/失败）
+/// 核心流程：项目根 → 每个 glob 的 find_files（记数与错误）→ 逐文件 read_file（记成功/失败）
 /// → 增量 diff 后写 storage；任何一步失败都在 `diag.error` 里留下错误文本再返回。
 fn refresh_index_inner(
     ctx: &Invocation,
@@ -1174,7 +1370,12 @@ fn refresh_index_inner(
             Err(error) => diag.find_errors.push(format!("{glob}: {error}")),
         }
         diag.globs_ms.insert((*glob).to_string(), now_ms().saturating_sub(began));
-        let phase = if glob.ends_with(".java") { "find_java" } else { "find_kt" };
+        let phase = match glob.rsplit('.').next() {
+            Some("java") => "find_java",
+            Some("kt") => "find_kt",
+            Some("py") => "find_py",
+            _ => "find_ts",
+        };
         checkpoint(diag, started, phase);
     }
     paths.sort();
@@ -1350,7 +1551,9 @@ const ROUTE_MARKERS: [&str; 7] = [
 /// 参数：`text` 为文件全文。
 /// 核心流程：文本里出现任一映射注解才认为可能含路由；纯 DTO/工具类直接跳过。
 fn looks_like_route_source(text: &str) -> bool {
-    ROUTE_MARKERS.iter().any(|marker| text.contains(marker)) || looks_like_fastapi(text)
+    ROUTE_MARKERS.iter().any(|marker| text.contains(marker))
+        || looks_like_fastapi(text)
+        || react_router::looks_like_route_file(text)
 }
 
 /// 参数：`text` 为文件全文。
@@ -1360,9 +1563,9 @@ fn looks_like_fastapi(text: &str) -> bool {
 }
 
 /// 解析器版本：改变解析行为时自增，旧索引会被整份丢弃并全量重解析。
-pub const PARSER_VERSION: &str = "2";
+pub const PARSER_VERSION: &str = "5";
 
-/// 落盘格式：`{"parser_version": "2", "routes": [...]}`。
+/// 落盘格式：`{"parser_version": "5", "routes": [...]}`。
 #[derive(serde::Serialize, serde::Deserialize)]
 struct StoredIndex {
     #[serde(default)]
@@ -1501,7 +1704,7 @@ fn now_ms() -> u64 {
 }
 
 /// 本插件扫描的来源 glob。
-const SOURCE_GLOBS: [&str; 3] = ["**/*.java", "**/*.kt", "**/*.py"];
+const SOURCE_GLOBS: [&str; 7] = ["**/*.java", "**/*.kt", "**/*.py", "**/*.tsx", "**/*.jsx", "**/*.ts", "**/*.js"];
 
 /// `refresh-index` 的诊断快照，原样写成 `diagnostics.json` 便于线上排查。
 #[derive(Default, serde::Serialize)]
@@ -1655,8 +1858,8 @@ fn setting_bool(key: &str, fallback: bool) -> bool {
     }
 }
 
-/// 默认排除的测试路径（settings.excludeGlobs 未配置时用）。
-pub const DEFAULT_EXCLUDE_GLOBS: &str = "**/tests/**,**/test/**,**/test_*.py,**/*_test.py,**/*Test.java,**/*Tests.java,**/src/test/**";
+/// 默认排除的测试、依赖与构建产物路径（settings.excludeGlobs 未配置时用）。
+pub const DEFAULT_EXCLUDE_GLOBS: &str = "**/node_modules/**,**/dist/**,**/build/**,**/coverage/**,**/tests/**,**/test/**,**/test_*.py,**/*_test.py,**/*Test.java,**/*Tests.java,**/src/test/**,**/*.test.*,**/*.spec.*,**/*.stories.*";
 
 /// 参数：无（读 `excludeTests`）。
 /// 核心流程：缺省开启；显式 `false` 才关闭。
@@ -1855,6 +2058,25 @@ mod tests {
         crate::load_index_for(Some(&root_of(host)))
     }
 
+    /// 把一批路由直接写进当前项目的索引缓存。
+    fn store_routes(host: &MockHost, routes: Vec<index::Route>) {
+        crate::save_index_for(Some(&root_of(host)), &index::RouteIndex { routes }).unwrap();
+    }
+
+    /// 测试用路由：无模块目标、无未解析标记。
+    fn route_of(path: &str, file: &str, framework: &str) -> index::Route {
+        index::Route {
+            method: "ANY".into(),
+            path: path.into(),
+            handler: "h".into(),
+            line: 3,
+            file: file.into(),
+            unresolved: false,
+            framework: framework.into(),
+            jump: None,
+        }
+    }
+
     /// 当前项目的索引存储键。
     fn index_key_of(host: &MockHost) -> String {
         crate::scoped_key(crate::INDEX_KEY, Some(&root_of(host)))
@@ -1926,8 +2148,46 @@ public class UserController {
     }
 
     #[test]
-    fn refresh_index_rescans_only_changed_files_and_starts_a_task() {
+    fn compatible_older_indexes_are_reused() {
+        assert!(!parser_compatible("2"), "0.3.5 的格式不再兼容");
+        assert!(parser_compatible("3"));
+        assert!(parser_compatible("4"));
+        assert!(parser_compatible(PARSER_VERSION));
+        assert!(!parser_compatible("99"), "比当前更新的格式不认");
+        assert!(!parser_compatible(""), "缺失版本视为不兼容");
+    }
+
+    #[test]
+    fn an_older_index_is_loaded_instead_of_wiped() {
         let host = MockHost::install();
+        let root = root_of(&host);
+        let stored = serde_json::json!({
+            "parser_version": "3",
+            "routes": [{
+                "method": "GET", "path": "/clipped", "handler": "routes/clipped/index",
+                "line": 5, "file": "/project/app/routes.ts", "unresolved": false,
+                "framework": "react-router"
+            }]
+        });
+        storage::set(&scoped_key(INDEX_KEY, Some(&root)), &stored.to_string()).unwrap();
+        let index = load_index_for(Some(&root));
+        assert_eq!(index.routes.len(), 1, "旧版本索引直接复用，不清空");
+        assert!(index.routes[0].jump.is_none(), "旧条目没有模块目标，回落声明行");
+    }
+
+    #[test]
+    fn an_older_compatible_index_survives_the_upgrade() {
+        let host = MockHost::install();
+        let root = root_of(&host);
+        storage::set(&scoped_key(INDEX_KEY, Some(&root)), r#"{"parser_version":"4","routes":[]}"#).unwrap();
+        storage::set(&scoped_key(SIGNATURE_KEY, Some(&root)), "{}").unwrap();
+        assert!(invalidate_derived(Some(&root)), "更旧的版本要求一次重扫");
+        assert!(storage::get(&scoped_key(INDEX_KEY, Some(&root))).unwrap().is_some(), "兼容索引不删");
+        assert!(storage::get(&scoped_key(SIGNATURE_KEY, Some(&root))).unwrap().is_none(), "签名清空以触发全量重扫");
+    }
+
+    #[test]
+    fn refresh_index_rescans_only_changed_files_and_starts_a_task() {        let host = MockHost::install();
         host.add_file("src/A.java", CONTROLLER);
         host.add_file("src/B.java", &CONTROLLER.replace("/v1/users/{id}", "/v1/others"));
         let first = RestfulToolkit::default().run_command(CMD_REFRESH_INDEX, &host.invocation(), None).unwrap().unwrap();
@@ -1999,7 +2259,7 @@ public class UserController {
         let mut plugin = RestfulToolkit::default();
         let page = plugin.search("routes", "users", 10, &host.invocation()).unwrap();
         assert_eq!(page.items.len(), 1);
-        assert_eq!(page.items[0].title, "GET /api/v1/users/{id}");
+        assert_eq!(page.items[0].title, "[java] GET /api/v1/users/{id}");
         let SearchTarget::Location(location) = &page.items[0].target else { panic!("应可跳转") };
         assert_eq!(location.range.start.line, 5, "注解行 6 → 0 基 5");
         assert_eq!(plugin.search("routes", "/api/v1/*", 10, &host.invocation()).unwrap().items.len(), 1);
@@ -2009,6 +2269,92 @@ public class UserController {
             "完整 URL 去掉 scheme/host/port 后按前缀命中"
         );
         assert!(plugin.search("routes", "nothing", 10, &host.invocation()).unwrap().items.is_empty());
+    }
+
+    #[test]
+    fn search_queries_parse_suffixes_and_tokens() {
+        assert_eq!(parse_search_query("/playback.ts"), ("/playback".to_string(), Some(RouteFilter::Ext("ts")), false));
+        assert_eq!(parse_search_query("/playback ext:py"), ("/playback".to_string(), Some(RouteFilter::Ext("py")), true));
+        assert_eq!(parse_search_query("/playback fw:react"), ("/playback".to_string(), Some(RouteFilter::Framework("react-router")), true));
+        assert_eq!(parse_search_query("/api/report.json"), ("/api/report.json".to_string(), None, false));
+        assert_eq!(parse_search_query("/v1.0/users"), ("/v1.0/users".to_string(), None, false));
+    }
+
+    #[test]
+    fn search_can_filter_by_extension_and_tags_each_source() {
+        let host = MockHost::install();
+        store_routes(
+            &host,
+            vec![
+                route_of("/playback", "/p/app/routes.tsx", "react-router"),
+                route_of("/playback", "/p/java/C.java", "spring"),
+                route_of("/playback", "/p/py/main.py", "fastapi"),
+            ],
+        );
+        let mut plugin = RestfulToolkit::default();
+        let all = plugin.search("routes", "/playback", 10, &host.invocation()).unwrap();
+        let titles: Vec<&str> = all.items.iter().map(|item| item.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            ["[tsx] ANY /playback", "[java] ANY /playback", "[py] ANY /playback"],
+            "按文件排序，并带来源标签"
+        );
+
+        let ts = plugin.search("routes", "/playback.ts", 10, &host.invocation()).unwrap();
+        assert_eq!(ts.items.len(), 1, ".ts 覆盖 .tsx");
+        assert_eq!(ts.items[0].title, "[tsx] ANY /playback");
+
+        assert_eq!(plugin.search("routes", "/playback ext:py", 10, &host.invocation()).unwrap().items.len(), 1);
+        assert_eq!(plugin.search("routes", "/playback fw:react", 10, &host.invocation()).unwrap().items.len(), 1);
+        let spring = plugin.search("routes", "/playback fw:spring", 10, &host.invocation()).unwrap();
+        assert_eq!(spring.items[0].title, "[java] ANY /playback");
+    }
+
+    #[test]
+    fn a_dotted_real_path_survives_the_suffix_filter() {
+        let host = MockHost::install();
+        store_routes(&host, vec![route_of("/release.ts", "/p/java/C.java", "spring")]);
+        let mut plugin = RestfulToolkit::default();
+        let page = plugin.search("routes", "/release.ts", 10, &host.invocation()).unwrap();
+        assert_eq!(page.items.len(), 1, "过滤后为空时回退成原样搜索");
+        assert_eq!(page.items[0].title, "[java] ANY /release.ts");
+    }
+
+    #[test]
+    fn the_search_command_output_tags_the_source() {
+        let host = MockHost::install();
+        store_routes(
+            &host,
+            vec![
+                route_of("/playback", "/p/app/routes.tsx", "react-router"),
+                route_of("/playback", "/p/py/main.py", "fastapi"),
+            ],
+        );
+        let index = load_index_for(Some(&root_of(&host)));
+        let lines = crate::search(&index, "/playback.ts", 10);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("[tsx] "), "{lines:?}");
+    }
+
+    #[test]
+    fn the_route_picker_tags_duplicate_paths_only() {
+        let host = MockHost::install();
+        store_routes(
+            &host,
+            vec![
+                route_of("/playback", "/p/app/routes.tsx", "react-router"),
+                route_of("/playback", "/p/py/main.py", "fastapi"),
+                route_of("/unique", "/p/py/main.py", "fastapi"),
+            ],
+        );
+        let index = load_index_for(Some(&root_of(&host)));
+        let (routes, ..) = goto_candidates(&index);
+        let labels: Vec<String> = routes
+            .iter()
+            .map(|route| goto_item(route, &[], route.path == "/playback").label)
+            .collect();
+        assert!(labels.iter().filter(|label| label.contains("/playback")).all(|label| label.starts_with('[')), "{labels:?}");
+        assert!(labels.iter().any(|label| label.contains("/unique") && !label.starts_with('[')), "单条路由不加标签：{labels:?}");
     }
 
     #[test]
@@ -2429,7 +2775,7 @@ public class OrderController {
         let json = openidea_plugin::host::fs::read_file(&format!("{dir}/diagnostics.json")).expect("诊断文件应存在");
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["project_root"], "/project");
-        assert_eq!(value["globs"].as_array().map(Vec::len), Some(3), "java/kt/py 三个 glob");
+        assert_eq!(value["globs"].as_array().map(Vec::len), Some(7), "java/kt/py/tsx/jsx/ts/js 七个 glob");
         assert_eq!(value["found"]["**/*.java"], 1);
         assert_eq!(value["files_read"], 1, "读成功数");
         assert_eq!(value["files_failed"], 0, "读失败数");
@@ -2693,6 +3039,131 @@ public class OrderController {
         assert_eq!(route.framework, "fastapi");
     }
 
+    const REACT_APP: &str = "\
+import { Routes, Route } from 'react-router-dom';
+
+export function App() {
+  return (
+    <Routes>
+      <Route path=\"/admin\">
+        <Route path=\"users\" element={<Users />} />
+      </Route>
+    </Routes>
+  );
+}
+";
+
+    #[test]
+    fn react_routes_reach_the_index_and_the_endpoints() {
+        let host = MockHost::install();
+        host.add_file("/project/src/pages/App.tsx", REACT_APP);
+        RestfulToolkit::default().run_command(CMD_REFRESH_INDEX, &host.invocation(), None).unwrap();
+        let route = current_index(&host)
+            .routes
+            .into_iter()
+            .find(|route| route.path == "/admin/users")
+            .expect("嵌套路由应拼成 /admin/users");
+        assert_eq!(route.framework, "react-router");
+        assert_eq!(route.method, "ANY");
+        assert_eq!(route.handler, "Users");
+        assert_eq!(route.line, 7, "行号指向 <Route> 所在行");
+
+        let endpoints = RestfulToolkit::default().endpoints(&host.invocation()).unwrap();
+        let published = endpoints.iter().find(|endpoint| endpoint.path == "/admin/users").expect("要发布到 endpoints");
+        assert_eq!(published.framework, "react-router");
+        assert!(published.method.is_none(), "前端路由没有 HTTP 动词");
+    }
+
+    #[test]
+    fn react_routes_jump_to_the_route_declaration() {
+        let host = MockHost::install();
+        host.add_file("/project/src/pages/App.tsx", REACT_APP);
+        RestfulToolkit::default().run_command(CMD_REFRESH_INDEX, &host.invocation(), None).unwrap();
+        let route = current_index(&host).routes.into_iter().find(|route| route.path == "/admin/users").unwrap();
+        host.answer_next_prompt(Some(&[tree::route_key(&route).as_str()]));
+        RestfulToolkit::default().run_command(CMD_GOTO_ROUTE, &host.invocation(), None).unwrap();
+        assert_eq!(host.opened_locations(), vec![("/project/src/pages/App.tsx".to_string(), 6, 0)], "第 7 行 → 0 基 6");
+    }
+
+    #[test]
+    fn a_changed_tsx_file_is_rescanned_incrementally() {
+        let host = MockHost::install();
+        host.add_file("/project/src/pages/App.tsx", REACT_APP);
+        RestfulToolkit::default().run_command(CMD_REFRESH_INDEX, &host.invocation(), None).unwrap();
+        host.add_file("/project/src/pages/App.tsx", &REACT_APP.replace("\"users\"", "\"members\""));
+        let event = Event::FilesChanged(openidea_plugin::FilesChanged {
+            created: Vec::new(),
+            modified: vec!["/project/src/pages/App.tsx".into()],
+            removed: Vec::new(),
+        });
+        let mut plugin = RestfulToolkit { last_flush: 0, ..RestfulToolkit::default() };
+        plugin.handle_events(&[event], &host.invocation());
+        let paths: Vec<String> = current_index(&host).routes.iter().map(|route| route.path.clone()).collect();
+        assert!(paths.contains(&"/admin/members".to_string()), "{paths:?}");
+        assert!(!paths.contains(&"/admin/users".to_string()), "旧路径要消失：{paths:?}");
+    }
+
+    #[test]
+    fn copying_a_react_route_yields_only_the_path() {
+        let host = MockHost::install();
+        host.add_file("/project/src/pages/App.tsx", REACT_APP);
+        RestfulToolkit::default().run_command(CMD_REFRESH_INDEX, &host.invocation(), None).unwrap();
+        let route = current_index(&host).routes.into_iter().find(|route| route.path == "/admin/users").unwrap();
+        RestfulToolkit::default().run_command(CMD_COPY_URL, &host.invocation(), Some(&tree::route_key(&route))).unwrap();
+        assert_eq!(url_of(&host), "/admin/users", "不拼 localhost:8080");
+    }
+
+    #[test]
+    fn unresolved_react_paths_stay_host_safe() {
+        let host = MockHost::install();
+        host.add_file("/project/src/pages/App.tsx", "export const App = () => (\\n  <Route path={cond ? '/a' : '/b'} element={<A />} />\\n);\\n");
+        RestfulToolkit::default().run_command(CMD_REFRESH_INDEX, &host.invocation(), None).unwrap();
+        assert!(current_index(&host).routes[0].unresolved);
+        let endpoints = RestfulToolkit::default().endpoints(&host.invocation()).unwrap();
+        assert_eq!(endpoints.len(), 1);
+        assert!(!endpoints[0].path.chars().any(char::is_whitespace), "宿主不接受含空白的路径：{}", endpoints[0].path);
+    }
+
+    #[test]
+    fn v7_route_configs_reach_the_index_and_jump() {
+        let host = MockHost::install();
+        let config = "\
+import { index, route } from \"@react-router/dev/routes\";
+export default [
+  route(\"/\", \"routes/_layout.tsx\", [
+    index(\"routes/index.tsx\"),
+    route(\"clipped\", \"routes/clipped/index.tsx\"),
+  ]),
+];
+";
+        host.add_file("/project/app/routes.ts", config);
+        host.add_file("/project/app/routes/clipped/index.tsx", "export default function C() { return null; }\n");
+        RestfulToolkit::default().run_command(CMD_REFRESH_INDEX, &host.invocation(), None).unwrap();
+        let route = current_index(&host)
+            .routes
+            .into_iter()
+            .find(|route| route.path == "/clipped")
+            .expect("v7 route() 的嵌套路径应进索引");
+        assert_eq!(route.framework, "react-router");
+        assert_eq!(route.handler, "routes/clipped/index");
+        assert_eq!(route.line, 5);
+        let jump = route.jump.as_ref().expect("v7 路由要记模块目标");
+        assert_eq!(jump.file, "/project/app/routes/clipped/index.tsx");
+        host.answer_next_prompt(Some(&[tree::route_key(&route).as_str()]));
+        RestfulToolkit::default().run_command(CMD_GOTO_ROUTE, &host.invocation(), None).unwrap();
+        assert_eq!(
+            host.opened_locations(),
+            vec![("/project/app/routes/clipped/index.tsx".to_string(), 0, 0)],
+            "跳转落在模块文件而不是 routes.ts 声明行"
+        );
+
+        let page = RestfulToolkit::default().search("routes", "/clipped", 10, &host.invocation()).unwrap();
+        let item = page.items.iter().find(|item| item.title.ends_with("/clipped")).expect("搜索结果");
+        let SearchTarget::Location(location) = &item.target else { panic!("搜索结果应可跳转") };
+        assert_eq!(location.path, "/project/app/routes/clipped/index.tsx");
+        assert_eq!(item.description.as_deref(), Some("/project/app/routes/clipped/index.tsx"));
+    }
+
     #[test]
     fn test_sources_are_excluded_at_index_time() {
         let host = MockHost::install();
@@ -2751,7 +3222,7 @@ public class OrderController {
         let index = current_index(&host);
         let files: Vec<&str> = index.routes.iter().map(|route| route.file.as_str()).collect();
         let subs = tree::subprojects(&files);
-        let label = goto_item(&index.routes[0], &subs).label;
+        let label = goto_item(&index.routes[0], &subs, false).label;
         assert!(label.starts_with("[haiyi-ai"), "候选条要带子项目前缀：{label}");
     }
 
@@ -2921,16 +3392,17 @@ public class OrderController {
             file: "/project/src/UserController.java".into(),
             unresolved: false,
             framework: "spring".into(),
+            jump: None,
         };
         index.routes = vec![route("POST", "/api/zebra", "create"), route("GET", "/api/users/{id}", "getUser")];
         let (routes, truncated, total) = goto_candidates(&index);
         assert!(!truncated);
         assert_eq!(total, 2);
         assert_eq!(routes[0].path, "/api/users/{id}", "按 path 排序");
-        let item = goto_item(routes[0], &[]);
+        let item = goto_item(routes[0], &[], false);
         assert_eq!(item.label, "GET  /api/users/{id}  — getUser", "方法在前、空格对齐、路径居中");
         assert_eq!(item.description.as_deref(), Some("UserController.java"));
-        assert_eq!(goto_item(routes[1], &[]).label, "POST /api/zebra  — create");
+        assert_eq!(goto_item(routes[1], &[], false).label, "POST /api/zebra  — create");
     }
 
     #[test]
@@ -2945,6 +3417,7 @@ public class OrderController {
                 file: "/project/A.java".into(),
                 unresolved: false,
                 framework: "spring".into(),
+                jump: None,
             })
             .collect();
         let (routes, truncated, total) = goto_candidates(&index);

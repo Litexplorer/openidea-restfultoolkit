@@ -1,10 +1,10 @@
 id = "openidea.restful-toolkit"
 name = "Restful Toolkit"
-version = "0.3.5"
-description = "Spring / JAX-RS / Kotlin route indexing in a text-only WASM sandbox: parse mappings from file text, join paths, publish endpoints."
+version = "0.4.4"
+description = "Spring / JAX-RS / Kotlin / React route indexing in a text-only WASM sandbox: parse mappings from file text, join paths, publish endpoints."
 authors = ["OpenIDEA contributors"]
 license = "Apache-2.0"
-change-notes = "0.3.5 — the index records a parser version; mismatched caches are discarded and rebuilt from scratch."
+change-notes = "0.4.4 — route search accepts .ext / ext: / fw: filters and tags each result with its source."
 categories = ["tools"]
 engines.openidea = "^1.14"
 wasm = "dist/plugin.wasm"
@@ -114,10 +114,10 @@ icon = "search"
 location = "services"
 detail = true
 
-# The index covers both languages; the host calls `endpoints` after any of these
+# The index covers backend and frontend sources; the host calls `endpoints` after any of these
 # files changes, and the plugin answers from its storage cache.
 [[contributes.endpoints]]
-files = ["**/*.java", "**/*.kt", "**/*.py"]
+files = ["**/*.java", "**/*.kt", "**/*.py", "**/*.tsx", "**/*.jsx", "**/*.ts", "**/*.js"]
 
 [[contributes.menus]]
 menu = "editor.context"

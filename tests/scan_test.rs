@@ -1,6 +1,6 @@
 //! `scan` 模块的集成测试：覆盖 Spring 注解识别、路径取值、行号与注释/字符串过滤。
 
-use openidea_restful_toolkit::scan::{class_base_path, scan_file, HttpMethod};
+use openidea_restful_toolkit::scan::{class_base_path, scan_any, scan_file, HttpMethod};
 
 // 覆盖点 1：没有任何映射注解的普通类 → 扫描结果为空，类级路径为空串。
 #[test]
@@ -124,4 +124,18 @@ public class FakeController {
 }
 ";
     assert_eq!(scan_file(src), Vec::new());
+}
+
+// 覆盖点：前端文件走 React 扫描，后端文件仍走注解扫描，互不影响。
+#[test]
+fn scan_any_dispatches_frontend_files_to_the_react_scanner() {
+    let tsx = "export const App = () => (\n  <Route path=\"/users\" element={<Users />} />\n);\n";
+    let endpoints = scan_any("src/App.tsx", tsx);
+    assert_eq!(endpoints.len(), 1);
+    assert_eq!(endpoints[0].path, "/users");
+    assert!(endpoints[0].react);
+    assert_eq!(endpoints[0].http_method, HttpMethod::RequestMapping);
+
+    let java = "@RestController\n@RequestMapping(\"/api\")\npublic class C {\n    @GetMapping(\"/a\")\n    public void a() {}\n}\n";
+    assert_eq!(scan_any("src/C.java", java).len(), 1, "Java 仍走 Spring 扫描");
 }

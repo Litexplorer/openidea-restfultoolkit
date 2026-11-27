@@ -34,7 +34,7 @@ pub(crate) fn tabs_for(ctx: &Invocation, key: &str) -> Vec<Tab> {
     let params_text = if query.is_empty() { crate::tr("No query parameters") } else { query };
     vec![
         Tab::new("method", &crate::tr("Method"), Pane::Text(cap(route.method.clone()))),
-        Tab::new("url", &crate::tr("Full URL"), Pane::Text(cap(url::join_url(&base, "", &route.path)))),
+        Tab::new("url", &crate::tr("Full URL"), Pane::Text(cap(url::route_url(&base, &route.framework, &route.path)))),
         Tab::new("params", &crate::tr("Params"), Pane::Text(cap(params_text))),
         Tab::new("body", &crate::tr("Body"), Pane::Text(cap(body))),
     ]
@@ -72,6 +72,7 @@ mod tests {
             file: file.into(),
             unresolved: false,
             framework: "spring".into(),
+            jump: None,
         }
     }
 

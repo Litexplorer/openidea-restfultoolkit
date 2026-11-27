@@ -25,7 +25,7 @@ pub struct Node {
 pub const ROOT: &str = "root";
 
 /// 空索引时根节点的提示（英文原文，渲染时按语言包本地化）。
-pub const EMPTY_HINT: &str = "No Spring/JAX-RS routes found: run Restful Toolkit: Rebuild Route Index, and make sure the project has @RestController/@RequestMapping";
+pub const EMPTY_HINT: &str = "No Spring/JAX-RS/React routes found: run Restful Toolkit: Rebuild Route Index, and make sure the project has @RestController/@RequestMapping or a react-router route";
 
 /// 参数：`index` 为路由索引。
 /// 核心流程：先统计每个模块的服务数并稳定排序（模块、文件、行、方法、路径）→
@@ -90,8 +90,16 @@ pub fn flatten(index: &RouteIndex) -> Vec<Node> {
         nodes.push(Node {
             key: route_key(route),
             parent: Some(class_key(&route.file)),
-            label: format!("[{}] {}", route.method, route.handler),
-            detail: Some(format!("{} {}", route.method, route.path)),
+            label: if route.framework == "react-router" {
+                if route.handler.is_empty() { route.path.clone() } else { route.handler.clone() }
+            } else {
+                format!("[{}] {}", route.method, route.handler)
+            },
+            detail: Some(if route.framework == "react-router" {
+                route.path.clone()
+            } else {
+                format!("{} {}", route.method, route.path)
+            }),
             expandable: false,
         });
     }
@@ -158,6 +166,16 @@ pub fn module_of(file: &str) -> String {
         let dir = file.rsplit_once('/').map_or("", |(dir, _)| dir);
         return dir.rsplit('/').find(|segment| !segment.is_empty()).unwrap_or("default").to_string();
     }
+    // 前端：取 src 下第一层目录（src/pages/users.tsx → pages）；直接在 src 下时退回目录名。
+    if [".tsx", ".jsx", ".ts", ".js"].iter().any(|ext| file.ends_with(ext)) {
+        if let Some((_, rest)) = file.rsplit_once("/src/") {
+            if let Some((first, _)) = rest.split_once('/') {
+                return first.to_string();
+            }
+        }
+        let dir = file.rsplit_once('/').map_or("", |(dir, _)| dir);
+        return dir.rsplit('/').find(|segment| !segment.is_empty()).unwrap_or("default").to_string();
+    }
     match file.find("/src/main/") {
         Some(at) => file[..at].rsplit('/').find(|s| !s.is_empty()).unwrap_or("default").to_string(),
         None => "default".to_string(),
@@ -203,6 +221,7 @@ mod tests {
             file: file.into(),
             unresolved: false,
             framework: "spring".into(),
+            jump: None,
         }
     }
 
@@ -297,6 +316,7 @@ mod tests {
                 file: "app/routers/items.py".into(),
                 unresolved: false,
                 framework: "fastapi".into(),
+                jump: None,
             }],
         };
         let labels: Vec<String> = flatten(&index).iter().map(|node| node.label.clone()).collect();
@@ -308,5 +328,32 @@ mod tests {
         assert_eq!(module_of("/p/billing/src/main/java/x/Y.java"), "billing");
         assert_eq!(module_of("src/main/java/x/Y.kt"), "default");
         assert_eq!(class_name("/p/a/UserController.kt"), "UserController");
+    }
+
+    #[test]
+    fn frontend_files_group_by_the_first_src_folder() {
+        assert_eq!(module_of("/p/web/src/pages/users.tsx"), "pages");
+        assert_eq!(module_of("/p/web/src/routes.tsx"), "src", "直接放在 src 下时退回目录名");
+        assert_eq!(module_of("/p/web/App.tsx"), "web");
+    }
+
+    #[test]
+    fn react_routes_show_the_path_without_an_http_verb() {
+        let index = RouteIndex {
+            routes: vec![Route {
+                method: "ANY".into(),
+                path: "/admin/users".into(),
+                handler: "Users".into(),
+                line: 7,
+                file: "/p/web/src/pages/App.tsx".into(),
+                unresolved: false,
+                framework: "react-router".into(),
+                jump: None,
+            }],
+        };
+        let nodes = flatten(&index);
+        let labels: Vec<&str> = nodes.iter().map(|node| node.label.as_str()).collect();
+        assert_eq!(labels, ["Found 1 services", "pages", "App", "Users"]);
+        assert_eq!(nodes.last().unwrap().detail.as_deref(), Some("/admin/users"));
     }
 }

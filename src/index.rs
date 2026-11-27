@@ -20,6 +20,16 @@ pub struct Route {
     pub unresolved: bool,
     /// `spring` 或 `jaxrs`，endpoints 的 framework 直接用它。
     pub framework: String,
+    /// 前端路由模块（v7 `route(path, module, ...)`）的跳转位置；有它时跳转优先用它。
+    #[serde(default)]
+    pub jump: Option<Jump>,
+}
+
+/// 第二跳位置：路由声明指向的模块文件（行号 1 基，打开时再转 0 基）。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Jump {
+    pub file: String,
+    pub line: u32,
 }
 
 /// 全项目路由索引，整体可按 JSON 存进 `storage`。
@@ -107,14 +117,18 @@ fn routes_of(file: &str, text: &str) -> Vec<Route> {
 fn routes_from(file: &str, text: &str, endpoints: Vec<scan::Endpoint>) -> Vec<Route> {
     let mut routes: Vec<Route> = Vec::new();
     for endpoint in endpoints {
-        let base = match class_path_above(text, endpoint.line) {
-            base if !base.is_empty() => base,
-            _ => scan::jaxrs_class_path(text),
+        let base = if endpoint.react {
+            String::new()
+        } else {
+            match class_path_above(text, endpoint.line) {
+                base if !base.is_empty() => base,
+                _ => scan::jaxrs_class_path(text),
+            }
         };
         // 全部补前导 `/`：宿主会整批校验路径，缺斜杠会让整份 endpoints 作废。
         let path = if endpoint.unresolved {
-            let raw = endpoint.path.trim();
-            if raw.starts_with('/') { raw.to_string() } else { format!("/{raw}") }
+            let raw = sanitize_unresolved(&endpoint.path);
+            if raw.starts_with('/') { raw } else { format!("/{raw}") }
         } else {
             let joined = url::join_url("", &base, &endpoint.path);
             if !valid_path(&joined) {
@@ -129,13 +143,16 @@ fn routes_from(file: &str, text: &str, endpoints: Vec<scan::Endpoint>) -> Vec<Ro
             line: endpoint.line,
             file: file.to_string(),
             unresolved: endpoint.unresolved,
-            framework: if endpoint.fastapi {
+            framework: if endpoint.react {
+                "react-router".to_string()
+            } else if endpoint.fastapi {
                 "fastapi".to_string()
             } else if endpoint.jaxrs {
                 "jaxrs".to_string()
             } else {
                 "spring".to_string()
             },
+            jump: endpoint.module.as_deref().map(|module| Jump { file: resolve_module(file, module), line: 1 }),
         };
         if !routes.contains(&route) {
             routes.push(route);
@@ -190,6 +207,36 @@ fn valid_path(path: &str) -> bool {
     path.starts_with('/') && !path.chars().any(char::is_whitespace)
 }
 
+/// 参数：`raw` 为未解析的路径原文（常量、三元表达式、函数调用等）。
+/// 核心流程：去掉空白与控制字符并截到 8192 字节，保证宿主整批校验不被单条打回。
+fn sanitize_unresolved(raw: &str) -> String {
+    raw.chars().filter(|ch| !ch.is_whitespace() && !ch.is_control()).take(8192).collect()
+}
+
+/// 参数：`file` 为声明路由的文件，`module` 为 v7 `route()` 的模块参数。
+/// 核心流程：以配置文件所在目录为基准拼接，展开 `.` 与 `..`，保留绝对路径。
+fn resolve_module(file: &str, module: &str) -> String {
+    let dir = file.rsplit_once('/').map_or("", |(dir, _)| dir);
+    let absolute = module.starts_with('/') || dir.starts_with('/');
+    let segments = if module.starts_with('/') {
+        module.split('/').collect::<Vec<_>>()
+    } else {
+        dir.split('/').chain(module.split('/')).collect()
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for segment in segments {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    let joined = parts.join("/");
+    if absolute { format!("/{joined}") } else { joined }
+}
+
 /// 参数：`route` 为索引里的一条路由。
 /// 核心流程：解析成功的路径一律以 `/` 开头；带 `${...}` 或不以 `/` 开头说明当时没解开。
 pub fn is_unresolved(route: &Route) -> bool {
@@ -215,8 +262,7 @@ mod tests {
     }
 
     #[test]
-    fn merges_routes_across_files() {
-        let index = RouteIndex::from_files(vec![
+    fn merges_routes_across_files() {        let index = RouteIndex::from_files(vec![
             ("src/A.java".into(), controller("/api", "/users", "users")),
             ("src/B.java".into(), controller("/admin/", "/stats", "stats")),
         ]);
@@ -354,5 +400,23 @@ mod tests {
         let text = controller("/api", "/x", "x");
         let index = RouteIndex::from_files(vec![("a.java".into(), text.clone()), ("a.java".into(), text)]);
         assert_eq!(index.routes.len(), 1, "同一文件的同一条路由只留一份");
+    }
+
+    #[test]
+    fn v7_module_paths_resolve_relative_to_the_config_file() {
+        let text = "import { route } from \"@react-router/dev/routes\";\nexport default [route(\"clipped\", \"./routes/clipped/index.tsx\"), route(\"shared\", \"../shared/page.tsx\")];\n";
+        let index = RouteIndex::from_files(vec![("/project/app/routes.ts".into(), text.into())]);
+        let files: Vec<&str> = index.routes.iter().map(|route| route.jump.as_ref().unwrap().file.as_str()).collect();
+        assert_eq!(files, ["/project/app/routes/clipped/index.tsx", "/project/shared/page.tsx"]);
+    }
+
+    #[test]
+    fn unresolved_paths_are_sanitized_for_the_host() {
+        let text = "export const App = () => (\n  <Route path={cond ? '/a' : '/b'} element={<A />} />\n);\n";
+        let index = RouteIndex::from_files(vec![("src/App.tsx".into(), text.into())]);
+        assert_eq!(index.routes.len(), 1);
+        let route = &index.routes[0];
+        assert!(route.unresolved);
+        assert!(valid_path(&route.path), "宿主整批校验不接受空白：{}", route.path);
     }
 }

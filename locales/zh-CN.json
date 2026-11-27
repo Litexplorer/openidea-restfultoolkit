@@ -41,7 +41,6 @@
   "Test parse": "测试解析",
   "Restful Toolkit: Run Parse": "Restful 工具箱：执行解析",
   "Restful Routes: 0 routes": "Restful 路由：0 条",
-  "No Spring/JAX-RS routes found: run Restful Toolkit: Rebuild Route Index, and make sure the project has @RestController/@RequestMapping": "未找到 Spring/JAX-RS 路由：先执行 Restful Toolkit: Rebuild Route Index，并确认项目里有 @RestController/@RequestMapping",
   "Scanned {} files, {} routes": "扫描 {} 个文件，命中 {} 条路由",
   "Filter routes (optional)": "筛选路由（可留空）",
   "Index is empty: run Rebuild Route Index first": "索引为空，请先执行 Rebuild Route Index",
@@ -52,5 +51,6 @@
   "hit the {} file cap, the index may be incomplete": "已达上限 {} 个文件，索引可能不完整",
   "Excluded {} test files": "已排除 {} 个测试文件",
   "Route has no source line: rebuild the index": "这条路由没有源码行号：请重建索引",
-  "Old index (no line numbers): rebuild the index": "旧索引（缺少行号），请重建"
+  "Old index (no line numbers): rebuild the index": "旧索引（缺少行号），请重建",
+  "未找到 Spring/JAX-RS/React 路由：先执行 Restful Toolkit: Rebuild Route Index，并确认项目里有 @RestController/@RequestMapping 或 react-router 路由声明": "未找到 Spring/JAX-RS/React 路由：先执行 Restful Toolkit: Rebuild Route Index，并确认项目里有 @RestController/@RequestMapping 或 react-router 路由声明"
 }

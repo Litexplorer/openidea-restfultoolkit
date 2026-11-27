@@ -47,14 +47,14 @@
     "excludeTests": {
       "type": "boolean",
       "title": "Exclude test files",
-      "description": "Leave routes in test sources out of the index (tests/, test_*.py, *Test.java, src/test/…).",
+      "description": "Leave routes in test, dependency and build sources out of the index (node_modules/, dist/, tests/, *.test.*, *.spec.*, *Test.java, src/test/…).",
       "default": true
     },
     "excludeGlobs": {
       "type": "string",
       "title": "Excluded path globs",
       "description": "Comma or newline separated globs; empty keeps the built-in defaults.",
-      "default": "**/tests/**,**/test/**,**/test_*.py,**/*_test.py,**/*Test.java,**/*Tests.java,**/src/test/**"
+      "default": "**/node_modules/**,**/dist/**,**/build/**,**/coverage/**,**/tests/**,**/test/**,**/test_*.py,**/*_test.py,**/*Test.java,**/*Tests.java,**/src/test/**,**/*.test.*,**/*.spec.*,**/*.stories.*"
     },
     "projectPrefixFilter": {
       "type": "string",

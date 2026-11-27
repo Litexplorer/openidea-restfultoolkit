@@ -41,7 +41,6 @@
   "Test parse": "Test parse",
   "Restful Toolkit: Run Parse": "Restful Toolkit: Run Parse",
   "Restful Routes: 0 routes": "Restful Routes: 0 routes",
-  "No Spring/JAX-RS routes found: run Restful Toolkit: Rebuild Route Index, and make sure the project has @RestController/@RequestMapping": "No Spring/JAX-RS routes found: run Restful Toolkit: Rebuild Route Index, and make sure the project has @RestController/@RequestMapping",
   "Scanned {} files, {} routes": "Scanned {} files, {} routes",
   "Filter routes (optional)": "Filter routes (optional)",
   "Index is empty: run Rebuild Route Index first": "Index is empty: run Rebuild Route Index first",
@@ -52,5 +51,6 @@
   "hit the {} file cap, the index may be incomplete": "hit the {} file cap, the index may be incomplete",
   "Excluded {} test files": "Excluded {} test files",
   "Route has no source line: rebuild the index": "Route has no source line: rebuild the index",
-  "Old index (no line numbers): rebuild the index": "Old index (no line numbers): rebuild the index"
+  "Old index (no line numbers): rebuild the index": "Old index (no line numbers): rebuild the index",
+  "No Spring/JAX-RS/React routes found: run Restful Toolkit: Rebuild Route Index, and make sure the project has @RestController/@RequestMapping or a react-router route": "No Spring/JAX-RS/React routes found: run Restful Toolkit: Rebuild Route Index, and make sure the project has @RestController/@RequestMapping or a react-router route"
 }

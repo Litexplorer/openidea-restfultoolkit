@@ -18,6 +18,10 @@ pub struct Endpoint {
     pub jaxrs: bool,
     /// 来自 FastAPI 装饰器（`@router.get` 等），索引里 framework 写 `fastapi`。
     pub fastapi: bool,
+    /// 来自 React 路由声明（`<Route>`、`createBrowserRouter` 等），索引里 framework 写 `react-router`。
+    pub react: bool,
+    /// v7 `route(path, module, ...)` 的模块参数（相对 app 目录），索引据此生成第二跳位置。
+    pub module: Option<String>,
 }
 
 /// 参数：`text` 为 Java 源码全文。
@@ -54,14 +58,23 @@ pub fn scan_kotlin(text: &str) -> Vec<Endpoint> {
 }
 
 /// 参数：`path` 为文件路径，`text` 为全文。
-/// 核心流程：按扩展名选 Spring 扫描器（`.kt` 走 Kotlin，其余走 Java），再并上 JAX-RS 结果；
-/// 同一文件含两套框架时各出一组，互不混合。
+/// 核心流程：`.py` 走 FastAPI、前端扩展名走 React，其余按 `.kt`/Java 走 Spring 并上 JAX-RS；
+/// 同一文件含两套后端框架时各出一组，互不混合。
 pub fn scan_any(path: &str, text: &str) -> Vec<Endpoint> {
     if path.ends_with(".py") {
         return scan_fastapi(text);
     }
+    if is_frontend_path(path) {
+        return crate::react_router::scan(text);
+    }
     let spring = if path.ends_with(".kt") { scan_kotlin(text) } else { scan_file(text) };
     spring.into_iter().chain(scan_jaxrs(text)).collect()
+}
+
+/// 参数：`path` 为文件路径。
+/// 核心流程：前端扩展名（ts/tsx/js/jsx）走 React 路由扫描。
+pub fn is_frontend_path(path: &str) -> bool {
+    [".tsx", ".jsx", ".ts", ".js"].iter().any(|ext| path.ends_with(ext))
 }
 
 /// FastAPI 支持的 HTTP 动词（装饰器方法名）。
@@ -124,7 +137,9 @@ pub fn scan_fastapi_with(text: &str, resolver: PrefixResolver<'_>) -> Vec<Endpoi
             unresolved,
             jaxrs: false,
             fastapi: true,
-        });
+            react: false,
+            module: None,
+        })
     }
     out
 }
@@ -375,6 +390,8 @@ impl Pending {
                     unresolved: self.unresolved,
                     jaxrs: false,
                     fastapi: false,
+                    react: false,
+                    module: None,
                 });
             }
         }
@@ -486,6 +503,8 @@ pub fn scan_jaxrs(text: &str) -> Vec<Endpoint> {
                         unresolved,
                         jaxrs: true,
                         fastapi: false,
+                        react: false,
+                        module: None,
                     });
                 }
             }

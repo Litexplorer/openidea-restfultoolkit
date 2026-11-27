@@ -45,6 +45,15 @@ pub fn join_url(base_url: &str, base_path: &str, method_path: &str) -> String {
     format!("{}{}", base, path)
 }
 
+/// 参数：`base` 为完整 base URL，`framework` 为路由来源，`path` 为归一化路径。
+/// 核心流程：前端路由不推导 dev server 地址，只返回路径；其余拼完整 URL。
+pub fn route_url(base: &str, framework: &str, path: &str) -> String {
+    if framework == "react-router" {
+        return path.to_string();
+    }
+    join_url(base, "", path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,5 +103,11 @@ mod tests {
     fn join_empty_base_returns_relative_path() {
         assert_eq!(join_url("", "/api", "/users"), "/api/users");
         assert_eq!(join_url("   ", "/api", ""), "/api");
+    }
+
+    #[test]
+    fn react_routes_keep_only_the_path() {
+        assert_eq!(route_url("http://localhost:5173", "react-router", "/users"), "/users");
+        assert_eq!(route_url("http://localhost:8080", "spring", "/users"), "http://localhost:8080/users");
     }
 }

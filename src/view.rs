@@ -83,6 +83,14 @@ fn activate(ctx: &Invocation, expanded: &mut BTreeSet<String>, key: &str) -> Res
         Some("r") => {
             let file = parts.next().unwrap_or_default();
             let line = parts.next().and_then(|line| line.parse::<u32>().ok()).ok_or("节点 key 缺少行号，请刷新索引")?;
+            // v7 前端路由记了模块文件：先跳到模块，模块失效再退回声明行。
+            let index = crate::load_index_for(crate::project_root(ctx).as_deref());
+            if let Some(route) = index.routes.iter().find(|route| crate::tree::route_key(route) == key) {
+                let (target, target_line) = crate::jump_location(route);
+                if target_line > 0 && ctx.project().is_none_or(|project| project.exists(target).unwrap_or(false)) {
+                    return open(ctx, target, target_line.saturating_sub(1));
+                }
+            }
             if line == 0 {
                 return Err(Error::Failed(crate::tr("Old index (no line numbers): rebuild the index")));
             }
@@ -169,6 +177,7 @@ mod tests {
             file: "/project/web/src/main/java/UserController.java".into(),
             unresolved: false,
             framework: "spring".into(),
+            jump: None,
         }
     }
 
@@ -193,6 +202,32 @@ mod tests {
         let key = items.last().unwrap().key.clone();
         plugin.handle(VIEW_ID, ViewEvent::Activate(key), &host.invocation()).unwrap();
         assert_eq!(host.opened_locations(), vec![("/project/web/src/main/java/UserController.java".into(), 6, 0)]);
+    }
+
+    #[test]
+    fn activate_prefers_the_v7_module_file() {
+        let mut route = route("/clipped", 6);
+        route.framework = "react-router".into();
+        route.file = "/project/app/routes.ts".into();
+        route.jump = Some(crate::index::Jump { file: "/project/app/routes/clipped/index.tsx".into(), line: 1 });
+        let key = crate::tree::route_key(&route);
+        let host = install(vec![route]);
+        host.add_file("/project/app/routes/clipped/index.tsx", "export default function C() { return null; }\n");
+        open_node(&host.invocation(), &key).unwrap();
+        assert_eq!(host.opened_locations(), vec![("/project/app/routes/clipped/index.tsx".into(), 0, 0)]);
+    }
+
+    #[test]
+    fn a_missing_module_falls_back_to_the_declaration() {
+        let mut route = route("/clipped", 6);
+        route.framework = "react-router".into();
+        route.file = "/project/app/routes.ts".into();
+        route.jump = Some(crate::index::Jump { file: "/project/app/routes/gone.tsx".into(), line: 1 });
+        let key = crate::tree::route_key(&route);
+        let host = install(vec![route]);
+        host.add_file("/project/app/routes.ts", "export default [];\n");
+        open_node(&host.invocation(), &key).unwrap();
+        assert_eq!(host.opened_locations(), vec![("/project/app/routes.ts".into(), 5, 0)]);
     }
 
     #[test]
